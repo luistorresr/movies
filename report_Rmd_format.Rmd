@@ -1,0 +1,627 @@
+---
+title: "Report_Rmd_format"
+author: "Luis D. Torres"
+date: "20/12/2020"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+# MovieLens Project Submission Report
+
+
+## Introduction
+
+This report presents the results of creating a movie recommendation system using the 10M version of MovieLens dataset available at https://grouplens.org/datasets/movielens/10m/
+
+The report uses a machine learning algorithm following a model based approach and the calculation of the residual mean squared error (RMSE) to compare models.  
+
+This report is structured in three sections. The next section explains the methods and analysis used including data cleaning, data exploration and visualization, and the modelling approach. The results section presents the modelling results and discusses the model performance using the RMSE as a loss function. The final section gives a brief summary of the report, its limitations and future work.
+
+
+## Method
+
+### Dataset 
+
+The movie recommendation system uses the 10M version of MovieLens dataset available at https://grouplens.org/datasets/movielens/10m/
+
+The dataset was divided in two main subsets:
+1. edx: 90% of the MovieLens data. Total observations of 9,000,063
+2. validation: 10% of MovieLens data. Total observations of 999,995
+
+All models were trained on the **edx** dataset. To facilitiate cross-validation, **edx** was further partitioned into _train_ (90% of edx) and _test_ (10% of edx). 
+
+The **validation** dataset was not used for training and cross-validation purposes. This set was used only for full validation. This implies testing the final algorithm and retrieving the full validation RMSE.
+
+```{r include=FALSE}
+
+library(tidyverse)
+library(caret)
+library(data.table)
+library(lubridate)
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+### For R 4.0 or later
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Partitioning the data intro edx and validation set. Validation set will be 10% of MovieLens data
+
+set.seed(1, sample.kind="Rounding")
+
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Making sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+
+##### Partitioning the edx data into train and test. Test is the 10% of the edx dataset
+
+set.seed(1, sample.kind="Rounding")
+
+index <- createDataPartition(y = edx$rating, times = 1, p = 0.1, list = FALSE)
+train <- edx[-index,]
+test <- edx[index,]
+
+rm(index)# remove index
+
+test <- test %>% 
+        semi_join(train, by = "movieId") %>%
+        semi_join(train, by = "userId") # make sure we don’t include users and movies in the test set that do not appear in the training set
+
+```
+
+### Variables
+
+* Outcome:
+The variable that the machine learning algorithm attemps to predicts is the _movie ratings_.
+
+* Features:
+The variables used to predict are: _movies_, _users_, _time_ (including day, week, month, year).  
+
+
+### Data cleaning
+
+The total observation included in the **edx** and **validation** datasets do not represent the exact percentages of the 10M MovieLens dataset. This is because users and movies in the **validation** set that do not appear in the **edx** set were removed and added back to the edx set. 
+
+Similarly, the **validation** set was also aligned to the user and movies present in the _train_ set. This was performed to facilitate full validation.
+
+### Data analysis
+
+Analysis were performed using three R packages: _tidyverse_, _data.table_ and _lubridate_ for data manipulation and visualisation; and the _caret_ for building machine learning models. 
+
+This report uses RMSE as the main loss function to compare models and their predictive value. If RMSE is larger than 1, it means the typical error is larger than one star. The model should aim at a value lower than 1 and ideally closer to 0.
+
+It also uses penalised least squares for regularisation purposes. Regularization penalise large estimates that are formed using small sample sizes.
+
+
+## Results
+
+### Inspecting the _train_ dataset 
+
+The total number of users and movies is:
+
+```{r number-users-provide-ratings, echo=FALSE}
+n_user_movie <- train %>%   summarize(number_users = n_distinct(userId),
+            number_movies = n_distinct(movieId)) %>%
+            knitr::kable()
+
+n_user_movie
+```
+
+Identifying user's rating for the top five movies:
+
+```{r top-5-movies, echo=FALSE}
+
+movie_top5 <- train %>%
+              dplyr::count(movieId) %>%
+              top_n(5) %>%
+              pull(movieId) # identifying the top 5 movies
+
+user_movie_tab <- train %>%
+                  filter(userId %in% c(1:20)) %>% 
+                  filter(movieId %in% movie_top5) %>% 
+                  select(userId, title, rating) %>% 
+                  spread(title, rating) # identifying user's rating for four movies
+
+user_movie_tab %>% knitr::kable()
+
+```
+
+Some movies receive more ratings than others as shown by the graph below: 
+
+```{r movies-receiving-ratings, echo=FALSE}
+train %>% 
+  dplyr::count(movieId) %>% 
+  ggplot(aes(n)) + 
+  geom_histogram(bins = 30, color = "black") + 
+  scale_x_log10() + 
+  ggtitle("Movies")
+```
+
+Some users also provide more ratings than others as shown by the graph below: 
+
+```{r user-providing-ratings, echo=FALSE}
+train %>%
+  dplyr::count(userId) %>% 
+  ggplot(aes(n)) + 
+  geom_histogram(bins = 30, color = "black") + 
+  scale_x_log10() +
+  ggtitle("Users")
+```
+
+
+### Building predictive models (Training stage)
+
+#### Model 1
+
+This is a simple model including just the average ratings for all movies and users. This model assumes the same rating for all movies and users with all the differences explained by random variation. Independent errors sampled from the same distribution should centered at 0 and the media (mu) would represent the “true” rating for all movies. 
+
+Therefore, as the estimate that minimises the RMSE is the least squares estimate of the media, in this case it be assumed that this is the average of all ratings:
+```{r average, echo=FALSE}
+mu <- mean(train$rating) 
+mu
+```
+
+If all unknown ratings are predicted with the calculated average, the RMSE is:
+
+```{r m1-rmse, echo=FALSE}
+m1_rmse <- RMSE(test$rating, mu)
+m1_rmse
+```
+
+In this case the RMSE is larger than 1 star rating. 
+
+
+#### Model 2
+
+Some movies may be rated higher than others, so building a model that accounts for this effect or bias may help to improve the predictive power. 
+
+By doing this, the achieved RMSE becomes:
+```{r m2_rmse, echo=FALSE}
+movie_avg <- train %>% 
+            group_by(movieId) %>% 
+            summarize(b_movie = mean(rating - mu))
+
+m2_p_ratings <- mu + test %>% 
+                    left_join(movie_avg, by='movieId') %>%
+                    pull(b_movie)
+
+m2_rmse <- RMSE(m2_p_ratings, test$rating)
+m2_rmse
+```
+
+This is better than model 1, but still close to 1 star deviation.
+
+#### Model 3
+
+As per the movie effect, some user may be giving higher ratings than other. Adding the user effect may also improve the prediction.
+
+By doing this, the achieved RMSE becomes:
+```{r m3_rmse, echo=FALSE}
+user_avg <- train %>% 
+  left_join(movie_avg, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_user = mean(rating - mu - b_movie))
+
+m3_p_ratings <- test %>% 
+                left_join(movie_avg, by='movieId') %>%
+                left_join(user_avg, by='userId') %>%
+                mutate(pred = mu + b_movie + b_user) %>%
+                pull(pred)
+
+m3_rmse <- RMSE(m3_p_ratings, test$rating)
+m3_rmse
+```
+
+#### Model 4
+
+The time in which a movie is watch could have an effect on the ratings given. For example, weekends people may be more relax to watch a movie and keen to provide a rating. Something sinmilar can be assumed for summer and winter months. Years could also play a role when considered that some "cult" movies have been released in those years. 
+
+I test for this assumptions by adding day, week, month and year to the models.
+
+By adding day to model 3, a small improvement is achieved in the RMSE value as follows:
+```{r m4_rmse, echo=FALSE}
+train <- mutate(train, date = as_datetime(timestamp))
+train <-  mutate(train, day = round_date(date, unit = "day"))
+test <- mutate(test, date = as_datetime(timestamp))
+test <-  mutate(test, day = round_date(date, unit = "day"))
+
+day_avg <- train %>% 
+  left_join(movie_avg, by='movieId') %>%
+  left_join(user_avg, by='userId') %>%
+  group_by(day) %>%
+  summarize(b_day = mean(rating - mu - b_movie - b_user))
+
+m4_p_ratings <- test %>% 
+  left_join(movie_avg, by='movieId') %>%
+  left_join(user_avg, by='userId') %>%
+  left_join(day_avg, by='day') %>%
+  mutate(pred = mu + b_movie + b_user + b_day) %>%
+  pull(pred)
+
+m4_rmse <- RMSE(m4_p_ratings, test$rating)
+m4_rmse
+```
+
+This improvement is not present when week is added to the model as the RMSE shows no change:
+```{r m5_rmse, echo=FALSE}
+train <-  mutate(train, week = round_date(date, unit = "week"))
+test <-  mutate(test, week = round_date(date, unit = "week"))
+
+week_avg <- train %>% 
+  left_join(movie_avg, by='movieId') %>%
+  left_join(user_avg, by='userId') %>%
+  left_join(day_avg, by='day') %>%
+  group_by(week) %>%
+  summarize(b_week = mean(rating - mu - b_movie - b_user - b_day))
+
+m5_p_ratings <- test %>% 
+  left_join(movie_avg, by='movieId') %>%
+  left_join(user_avg, by='userId') %>%
+  left_join(day_avg, by='day') %>%
+  left_join(week_avg, by='week') %>%
+  mutate(pred = mu + b_movie + b_user + b_day + b_week) %>%
+  pull(pred)
+
+m5_rmse <- RMSE(m5_p_ratings, test$rating)
+m5_rmse
+```
+
+Consequently, Week is no considered any longer in the models.
+
+Similarly, month does not add to the model when added to the movie+user+day model. The achieved RMSE is:
+```{r m6_rmse, echo=FALSE}
+train <-  mutate(train, month = round_date(date, unit = "month"))
+test <-  mutate(test, month = round_date(date, unit = "month"))
+
+month_avg <- train %>% 
+  left_join(movie_avg, by='movieId') %>%
+  left_join(user_avg, by='userId') %>%
+  left_join(day_avg, by='day') %>%
+  group_by(month) %>%
+  summarize(b_month = mean(rating - mu - b_movie - b_user - b_day))
+
+m6_p_ratings <- test %>% 
+  left_join(movie_avg, by='movieId') %>%
+  left_join(user_avg, by='userId') %>%
+  left_join(day_avg, by='day') %>%
+  left_join(month_avg, by='month') %>%
+  mutate(pred = mu + b_movie + b_user + b_day + b_month) %>%
+  pull(pred)
+
+m6_rmse <- RMSE(m6_p_ratings, test$rating)
+m6_rmse
+```
+
+Consequently, month is no considered any longer in the models.
+
+Likewise, year does not improve the RMSE:
+```{r m7_rmse, echo=FALSE}
+train <-  mutate(train, year = round_date(date, unit = "year"))
+test <-  mutate(test, year = round_date(date, unit = "year"))
+
+year_avg <- train %>% 
+  left_join(movie_avg, by='movieId') %>%
+  left_join(user_avg, by='userId') %>%
+  left_join(day_avg, by='day') %>%
+  group_by(year) %>%
+  summarize(b_year = mean(rating - mu - b_movie - b_user - b_day))
+
+m7_p_ratings <- test %>% 
+  left_join(movie_avg, by='movieId') %>%
+  left_join(user_avg, by='userId') %>%
+  left_join(day_avg, by='day') %>%
+  left_join(year_avg, by='year') %>%
+  mutate(pred = mu + b_movie + b_user + b_day + b_year) %>%
+  pull(pred)
+
+m7_rmse <- RMSE(m7_p_ratings, test$rating)
+m7_rmse 
+```
+
+As a result, only day is considered relevant to improve the prediction.
+
+
+### Regularisation of predictive models
+
+Regularisation allows to penalise large estimates that are formed using small sample sizes. 
+This useful in this case. For example, by using only the movie effects on the graph below it can shown the top 10 worst and best movies based on the movie efect and number of ratings. As showed the supposed “best” and “worst” movies were rated by very few users, in most cases only 1.
+
+```{r best-movies, echo=FALSE}
+movie_titles <- train %>% 
+  select(movieId, title) %>%
+  distinct()
+
+train %>% dplyr::count(movieId) %>% 
+  left_join(movie_avg) %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(desc(b_movie)) %>% 
+  select(title, b_movie, n) %>% 
+  slice(1:10) %>% 
+  knitr::kable()
+```
+
+```{r worst-movies, echo=FALSE}
+train %>% dplyr::count(movieId) %>% 
+  left_join(movie_avg) %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(b_movie) %>% 
+  select(title, b_movie, n) %>% 
+  slice(1:10) %>% 
+  knitr::kable()
+```
+
+Therefore, the regularisation approach taken here considers models builded in the previous step (model 2 to 4). 
+
+#### Regularised model 2
+
+To regularise the movie effect model, the first step is to identify a penalty term or lambda. The results of a cross-validation procedure to choose lambda is shown in the graph below:  
+
+```{r lambdas, echo=FALSE, message=FALSE, warning=FALSE}
+lambdas <- seq(0, 10, 0.25)
+
+m2_rmses <- sapply(lambdas, function(l){
+  mu <- mean(train$rating)
+  b_movie <- train %>%
+    group_by(movieId) %>%
+    summarize(b_movie = sum(rating - mu)/(n()+l))
+  m2_reg_p_ratings <- test %>% 
+    left_join(b_movie, by = "movieId") %>%
+    mutate(pred = mu + b_movie) %>%
+    pull(pred)
+  return(RMSE(m2_reg_p_ratings, test$rating))
+})
+
+qplot(lambdas, m2_rmses) 
+
+```
+
+The lambda value that minimises RMSE is:
+
+```{r, m2-lambda, echo=FALSE}
+m2_lambda <- lambdas[which.min(m2_rmses)]
+m2_lambda
+```
+
+With the chosen lambda, it is possible to compute the regularised estimates for model 2 and compare them to the original estimates. As shown on the graph below, when _n_ is small the values shrink towards zero:
+
+```{r graph-m2_reg, echo=FALSE}
+movie_reg_avg <- train %>% 
+  group_by(movieId) %>% 
+  summarize(b_movie = sum(rating - mu)/(n()+m2_lambda), n_i = n())
+
+tibble(Least_squares_estimates = movie_avg$b_movie, 
+       Regularised_estimates = movie_reg_avg$b_movie, 
+       n = movie_reg_avg$n_i) %>%
+  ggplot(aes(Least_squares_estimates, Regularised_estimates, size=sqrt(n))) + 
+  geom_point(shape=1, alpha=0.5)
+```
+
+The regularised model also seems to be more accurate at identifying the top 10 best and worst movies compare to the model without regularisation above. The regularised model for the top  10 best movies is shown below:
+
+```{r, echo=FALSE}
+train %>%
+  count(movieId) %>% 
+  left_join(movie_reg_avg, by = "movieId") %>%
+  left_join(movie_titles, by = "movieId") %>%
+  arrange(desc(b_movie)) %>%
+  slice(1:10) %>% 
+  pull(title)
+```
+
+The regularised model for the top 10 worst movies is shown below:
+
+```{r, echo=FALSE}
+train %>%
+  count(movieId) %>% 
+  left_join(movie_reg_avg, by = "movieId") %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(b_movie) %>% 
+  select(title, b_movie, n) %>% 
+  slice(1:10) %>% 
+  pull(title)
+```
+
+The resulted RMSE after this regularisation is:
+
+```{r, echo=FALSE}
+min(m2_rmses)
+```
+
+#### Regularised model 3
+
+To regularise the user effect model, a similar procedure is follow. 
+
+The results of a cross-validation procedure to choose lambda is shown in the graph below:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+m3_rmses <- sapply(lambdas, function(l){
+  mu <- mean(train$rating)
+  b_movie <- train %>%
+            group_by(movieId) %>%
+            summarize(b_movie = sum(rating - mu)/(n()+l))
+  b_user <- train %>% 
+            left_join(b_movie, by="movieId") %>%
+            group_by(userId) %>%
+            summarize(b_user = sum(rating - b_movie - mu)/(n()+l))
+  m3_reg_p_ratings <- test %>% 
+    left_join(b_movie, by = "movieId") %>%
+    left_join(b_user, by = "userId") %>%
+    mutate(pred = mu + b_movie + b_user) %>%
+    pull(pred)
+  return(RMSE(m3_reg_p_ratings, test$rating))
+})
+
+qplot(lambdas, m3_rmses)    
+```
+
+The lambda value that minimises RMSE is:
+
+```{r, echo=FALSE}
+m3_lambda <- lambdas[which.min(m3_rmses)]
+m3_lambda
+```
+
+With the chosen lambda, it is possible to compute the regularised estimates for model 3 and compare them to the original estimates. As for the previous case, when _n_ is small the values shrink towards zero:
+
+```{r, echo=FALSE}
+user_reg_avg <- train %>% 
+  left_join(movie_reg_avg, by='movieId') %>%
+  group_by(userId) %>% 
+  summarize(b_user = sum(rating - b_movie - mu)/(n()+m3_lambda), n_i = n())
+
+tibble(Least_squares_estimates = user_avg$b_user, 
+       Regularised_estimates = user_reg_avg$b_user, 
+       n = user_reg_avg$n_i) %>%
+  ggplot(aes(Least_squares_estimates, Regularised_estimates, size=sqrt(n))) + 
+  geom_point(shape=1, alpha=0.5)
+```
+
+The resulted RMSE after this regularisation is:
+
+```{r, echo=FALSE}
+min(m3_rmses)
+```
+
+#### Regularisation model 4
+
+To regularise the day effect model, a similar procedure is follow. 
+
+The results of a cross-validation procedure to choose lambda is shown in the graph below: 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+m4_rmses <- sapply(lambdas, function(l){
+  mu <- mean(train$rating)
+  b_movie <- train %>%
+    group_by(movieId) %>%
+    summarize(b_movie = sum(rating - mu)/(n()+l))
+  b_user <- train %>% 
+    left_join(b_movie, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_user = sum(rating - b_movie - mu)/(n()+l))
+  b_day <- train %>% 
+    left_join(b_movie, by="movieId") %>%
+    left_join(b_user, by="userId") %>%
+    group_by(day) %>%
+    summarize(b_day = sum(rating - b_movie - b_user - mu)/(n()+l))
+  m4_reg_p_ratings <- test %>% 
+    left_join(b_movie, by = "movieId") %>%
+    left_join(b_user, by = "userId") %>%
+    left_join(b_day, by = "day") %>%
+    mutate(pred = mu + b_movie + b_user + b_day) %>%
+    pull(pred)
+  return(RMSE(m4_reg_p_ratings, test$rating))
+})
+
+qplot(lambdas, m4_rmses) 
+```
+
+The lambda value that minimises RMSE is:
+
+```{r, echo=FALSE}
+m4_lambda <- lambdas[which.min(m4_rmses)]
+m4_lambda
+```
+
+With the chosen lambda, it is possible to compute the regularised estimates for model 4 and compare them to the original estimates. As for the previous two cases, when _n_ is small the values shrink towards zero:
+
+```{r, echo=FALSE}
+day_reg_avg <- train %>% 
+  left_join(movie_reg_avg, by='movieId') %>%
+  left_join(user_reg_avg, by='userId') %>%
+  group_by(day) %>% 
+  summarize(b_day = sum(rating - b_movie - b_user - mu)/(n()+m4_lambda), n_i = n())
+
+tibble(Least_squares_estimates = day_avg$b_day, 
+       Regularised_estimates = day_reg_avg$b_day, 
+       n = day_reg_avg$n_i) %>%
+  ggplot(aes(Least_squares_estimates, Regularised_estimates, size=sqrt(n))) + 
+  geom_point(shape=1, alpha=0.5)
+```
+
+The resulted RMSE after this regularisation is:
+
+```{r, echo=FALSE}
+min(m4_rmses)
+```
+
+
+### Validation with the best performing model (full validation stage)
+
+The regularised model 4 is the best performing model. The model accounts for the movie, user and day effect or bias. 
+
+By applying the algorithm to the **validation** dataset, the final achieved RMSE is:
+
+```{r, echo=FALSE}
+validation <- mutate(validation, date = as_datetime(timestamp))
+validation <-  mutate(validation, day = round_date(date, unit = "day"))
+
+validation <- validation %>% 
+  semi_join(train, by = "movieId") %>%
+  semi_join(train, by = "userId") %>%
+  semi_join(train, by = "day")
+
+
+validation_pred <- validation %>% 
+  left_join(movie_reg_avg, by = "movieId") %>%
+  left_join(user_reg_avg, by = "userId") %>%
+  left_join(day_reg_avg, by = "day") %>%
+  mutate(pred = mu + b_movie + b_user + b_day)
+
+validation_rmse <- RMSE(validation_pred$pred, validation$rating) 
+validation_rmse
+
+```
+
+
+## Conclusions
+
+This work attempted to build a movie recommendation system using the 10M version of MovieLens dataset. By following a model based approach, the effects of movies, users and time were considered. Regularisations was also implemented to account for those ratings with small sample sizes. 
+
+The result of the process shows that a regularised model accounting for the movie, user and day effect achieve the highest level of prediction as shown on the table below:
+
+```{r rmse-summary, echo=FALSE}
+rmse_models <- tibble(method = "Model 1: Average ratings", RMSE = m1_rmse)
+rmse_models <- bind_rows(rmse_models, tibble(method="Model 2: Movie effect", RMSE = m2_rmse))
+rmse_models <- bind_rows(rmse_models, tibble(method="Model 3: Movie + user effect", RMSE = m3_rmse))
+rmse_models <- bind_rows(rmse_models, tibble(method="Model 4: Movie + user + day effect", RMSE = m4_rmse))
+rmse_models <- bind_rows(rmse_models, tibble(method="Model 2 reg: Movie effect regularisation", RMSE = min(m2_rmses)))
+rmse_models <- bind_rows(rmse_models, tibble(method="Model 3 reg: Movie + user effect regularisation", RMSE = min(m3_rmses)))
+rmse_models <- bind_rows(rmse_models, tibble(method="Model 4 reg: Movie + user + day effect regularisation", RMSE = min(m4_rmses)))
+rmse_models <- bind_rows(rmse_models,
+                         tibble(method="Validation",
+                                RMSE = min(validation_rmse)))
+
+rmse_models %>% knitr::kable()
+```
+
+The tested models fail to account for groups of, for instance, movies and groups of users variation as they may have similar rating patterns. Future work should account for this effects by using matrix factorization method. This method will find rating patterns for groups of movies, users and days. Also, future work should unclude the genre of the movie as this report did not include it. 
